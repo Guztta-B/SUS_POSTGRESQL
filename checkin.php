@@ -1,60 +1,141 @@
 <?php
-header('Content-Type: application/json; charset=utf-8');
+
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: POST, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type");
+header("Content-Type: application/json; charset=UTF-8");
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit();
+}
+
 date_default_timezone_set('America/Sao_Paulo');
 
-require 'conexao.php'; // deve fornecer $pdo
+include_once 'conexao.php';
 
-function responder($codigo, $sucesso, $extra = []) {
-    http_response_code($codigo);
-    echo json_encode(array_merge(['sucesso' => $sucesso], $extra));
-    exit;
+$dados = json_decode(file_get_contents("php://input"));
+
+if (empty($dados->id)) {
+    http_response_code(400);
+
+    echo json_encode([
+        "sucesso" => false,
+        "mensagem" => "ID do agendamento não informado."
+    ]);
+
+    exit();
 }
 
-$entrada = json_decode(file_get_contents('php://input'), true);
-$id = (int)($entrada['id'] ?? 0);
+try {
 
-$st = $pdo->prepare(
-    'SELECT id, unidade, status, data_hora, ticket
-       FROM agendamentos WHERE id = ?'
-);
-$st->execute([$id]);
-$ag = $st->fetch(PDO::FETCH_ASSOC);
+    // Busca o agendamento
+    $stmt = $conn->prepare("
+        SELECT id, unidade, status, data_hora, ticket
+        FROM agendamentos
+        WHERE id = :id
+        LIMIT 1
+    ");
 
-if (!$ag) {
-    responder(404, false, ['mensagem' => 'Agendamento não encontrado.']);
-}
+    $stmt->bindParam(':id', $dados->id, PDO::PARAM_INT);
+    $stmt->execute();
 
-if (strtolower(trim($ag['status'])) === 'cancelado') {
-    responder(400, false, ['mensagem' => 'Este agendamento foi cancelado.']);
-}
+    $ag = $stmt->fetch(PDO::FETCH_ASSOC);
 
-$hoje = date('Y-m-d');
+    if (!$ag) {
+        http_response_code(404);
 
-if (substr($ag['data_hora'], 0, 10) !== $hoje) {
-    responder(400, false, [
-        'mensagem' => 'O check-in só pode ser feito no dia do atendimento.'
+        echo json_encode([
+            "sucesso" => false,
+            "mensagem" => "Agendamento não encontrado."
+        ]);
+
+        exit();
+    }
+
+    if (strtolower(trim($ag['status'])) === 'cancelado') {
+        http_response_code(400);
+
+        echo json_encode([
+            "sucesso" => false,
+            "mensagem" => "Este agendamento foi cancelado."
+        ]);
+
+        exit();
+    }
+
+    $hoje = date('Y-m-d');
+
+    // Só permite check-in no dia do atendimento
+    if (substr($ag['data_hora'], 0, 10) !== $hoje) {
+        http_response_code(400);
+
+        echo json_encode([
+            "sucesso" => false,
+            "mensagem" => "O check-in só pode ser feito no dia do atendimento."
+        ]);
+
+        exit();
+    }
+
+    // Já fez check-in: devolve o mesmo ticket
+    if (!empty($ag['ticket'])) {
+        http_response_code(200);
+
+        echo json_encode([
+            "sucesso" => true,
+            "ticket" => $ag['ticket']
+        ]);
+
+        exit();
+    }
+
+    // Próximo número da fila daquela unidade hoje
+    $stmtContar = $conn->prepare("
+        SELECT COUNT(*)
+        FROM agendamentos
+        WHERE unidade = :unidade
+          AND ticket IS NOT NULL
+          AND DATE(checkin_em) = :hoje
+    ");
+
+    $stmtContar->bindParam(':unidade', $ag['unidade']);
+    $stmtContar->bindParam(':hoje', $hoje);
+    $stmtContar->execute();
+
+    $numero = (int) $stmtContar->fetchColumn() + 1;
+
+    $ticket = 'A' . str_pad($numero, 3, '0', STR_PAD_LEFT);
+
+    // Salva ticket e horário da chegada
+    $agora = date('Y-m-d H:i:s');
+
+    $stmtUpdate = $conn->prepare("
+        UPDATE agendamentos
+        SET ticket = :ticket,
+            checkin_em = :checkin_em
+        WHERE id = :id
+    ");
+
+    $stmtUpdate->bindParam(':ticket', $ticket);
+    $stmtUpdate->bindParam(':checkin_em', $agora);
+    $stmtUpdate->bindParam(':id', $dados->id, PDO::PARAM_INT);
+    $stmtUpdate->execute();
+
+    http_response_code(200);
+
+    echo json_encode([
+        "sucesso" => true,
+        "ticket" => $ticket
+    ]);
+
+} catch (PDOException $e) {
+
+    http_response_code(500);
+
+    echo json_encode([
+        "sucesso" => false,
+        "mensagem" => "Erro no banco de dados."
     ]);
 }
-
-// Já fez check-in: devolve o mesmo ticket
-if (!empty($ag['ticket'])) {
-    responder(200, true, ['ticket' => $ag['ticket']]);
-}
-
-// Próximo número da fila daquela unidade hoje
-$c = $pdo->prepare(
-    'SELECT COUNT(*) FROM agendamentos
-      WHERE unidade = ? AND ticket IS NOT NULL
-        AND DATE(checkin_em) = ?'
-);
-$c->execute([$ag['unidade'], $hoje]);
-$numero = (int)$c->fetchColumn() + 1;
-
-$ticket = 'A' . str_pad($numero, 3, '0', STR_PAD_LEFT);
-
-$up = $pdo->prepare(
-    'UPDATE agendamentos SET ticket = ?, checkin_em = ? WHERE id = ?'
-);
-$up->execute([$ticket, date('Y-m-d H:i:s'), $id]);
-
-responder(200, true, ['ticket' => $ticket]);
+?>
